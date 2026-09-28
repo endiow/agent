@@ -14,6 +14,7 @@ __pycache__/
 # 5. RAG 生成的向量索引（由 rag_utils.py 生成，可重建）
 AgentStudy/**/docs/vectors.npy
 AgentStudy/**/docs/chunks.json
+chroma_db/
 
 # 6. 运行时生成的日志与记忆文件
 tool_log.jsonl
