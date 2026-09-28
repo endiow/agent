@@ -21,3 +21,6 @@ tool_log.jsonl
 session.json
 long_term_memory.json
 memory/
+
+# 7. 密钥
+*.pem
