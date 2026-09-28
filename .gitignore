@@ -20,3 +20,4 @@ chroma_db/
 tool_log.jsonl
 session.json
 long_term_memory.json
+memory/
