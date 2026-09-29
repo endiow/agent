@@ -1,8 +1,13 @@
 """
-阶段五：Plan-and-Execute Agent
+阶段五：Plan-and-Execute Agent（含短期记忆）
 规划 → 执行 → 反思 → 推进 → 汇总
 复用阶段四的 RAG、记忆工具和用户上下文
 支持 switch 切换用户 / clear 清空会话
+
+短期记忆机制：
+  - State 里声明 messages: Annotated[list, add_messages]
+  - thread_id 固定为 {user_id}_session
+  - finalizer 把 AI 回复写回 messages
 """
 
 import os
@@ -10,15 +15,16 @@ import json
 import re
 import datetime
 import sqlite3
-from typing import TypedDict, Optional
+from typing import TypedDict, Optional, Annotated
 from functools import lru_cache
 
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain.agents import create_agent
 from langchain_core.tools import tool
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, AIMessage
 from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 from rag_utils import get_retriever
@@ -141,27 +147,37 @@ def get_inner_agent():
     )
 
 
-# ── 5. State ─────────────────────────────────────────
+# ── 5. State（★ 新增 messages） ──────────────────────
 class PlanExecuteState(TypedDict):
     task: str
+    messages: Annotated[list, add_messages]     # ★ 跨轮对话历史
     plan: list
     current_step: str
     past_steps: list
     last_result: str
-    last_tool_log: list                # 当前步骤的工具调用记录
+    last_tool_log: list
     reflection_feedback: Optional[str]
     reflection_count: int
     final_response: str
 
 
-# ── 6. 提示词 ────────────────────────────────────────
+# ── 6. 提示词（★ Planner / Summarizer 加入 conversation） ──
 PLANNER_PROMPT = """你是一个任务规划器。请将用户的复杂任务拆解成一系列清晰、有序、可独立执行的步骤。
+
+【历史对话】
+{conversation}
+
+【本轮任务】
+{task}
 
 要求：
 1. 每个步骤只做一件事，描述要具体、可执行。
 2. 步骤之间要有明确的先后顺序。
-3. 只输出 JSON，不要任何解释、不要 markdown 代码块。
-4. JSON 格式严格如下：
+3. 如果本轮任务里出现了指代（"这个""刚才""上面那个""再算一次"），
+   必须结合历史对话把它消解成自包含的表述，不要让执行器去猜。
+   例：历史里问过"深圳天气"，本轮说"那北京呢" → 步骤应写成"查询北京天气"。
+4. 只输出 JSON，不要任何解释、不要 markdown 代码块。
+5. JSON 格式严格如下：
 {{"steps": ["步骤1", "步骤2", "步骤3"]}}
 
 你可以使用的工具（供参考，不要写进步骤描述）：
@@ -170,8 +186,6 @@ PLANNER_PROMPT = """你是一个任务规划器。请将用户的复杂任务拆
 - calculator：数学计算
 - get_current_time：获取当前时间
 - save_memory / recall_memory / list_memories：长期记忆
-
-用户任务：{task}
 
 如果任务很简单（1-2 步可以完成），不要强行拆成更多步骤。
 简单的事实查询、概念解释，通常 1 步就够了。
@@ -211,8 +225,7 @@ REFLECTOR_PROMPT = """你是一个严格的审查者，负责检查任务执行�
 审查标准：
 - 如果执行器有工具调用，且最终输出的事实与工具返回一致 → 通过。
 - 如果工具本身返回的是模拟数据，只要执行器忠实引用了工具返回的内容 → 通过。
-  工具的数据来源问题不是执行器的责任。
-- 只有执行器在工具返回之外添加了未提供的事实（如自行编造"数据来源于API"）→ 不通过。
+- 只有执行器在工具返回之外添加了未提供的事实 → 不通过。
 - 如果最终输出只是"描述了打算做什么"而没有实际产出 → 不通过。
 - 如果执行器对信息不足的情况正确标注了 "[信息不足]" → 通过。
 
@@ -220,14 +233,21 @@ REFLECTOR_PROMPT = """你是一个严格的审查者，负责检查任务执行�
 {{"passed": true 或 false, "critique": "如果不通过，写具体问题；如果通过，写'无问题'"}}
 """
 
-SUMMARIZER_PROMPT = """请根据以下已完成的任务步骤和结果，为用户生成一段完整、自然的最终回答。
+SUMMARIZER_PROMPT = """请根据历史对话和本轮执行结果，为用户生成一段完整、自然的最终回答。
 
-原始任务：{task}
+【历史对话】
+{conversation}
 
-各步骤结果：
+【本轮任务】
+{task}
+
+【本轮各步骤结果】
 {results}
 
-要求：用简洁的中文回答，直接说结论，不要罗列"步骤1、步骤2"，要像正常对话一样流畅。
+要求：
+1. 用简洁的中文回答，直接说结论，像正常对话一样流畅。
+2. 不要罗列"步骤1、步骤2"，也不要说"根据专家"、"根据工具"。
+3. 如果结果里有 "[信息不足]" 之类的占位，如实告知用户，不要编造。
 """
 
 
@@ -253,7 +273,6 @@ def _extract_tool_log(messages: list) -> list:
             continue
         for tc in tool_calls:
             tool_result = None
-            # 向后查找对应的 ToolMessage
             for later in messages[i + 1:]:
                 if getattr(later, "tool_call_id", None) == tc["id"]:
                     tool_result = later.content
@@ -266,9 +285,26 @@ def _extract_tool_log(messages: list) -> list:
     return tool_log
 
 
+def _format_conversation(messages: list) -> str:
+    """把 messages 格式化成对话文本"""
+    if not messages:
+        return "（无）"
+    label = {"human": "用户", "ai": "助手", "system": "系统"}
+    lines = []
+    for m in messages:
+        role = getattr(m, "type", "?")
+        content = getattr(m, "content", "")
+        lines.append(f"{label.get(role, role)}：{content}")
+    return "\n".join(lines)
+
+
 # ── 8. 节点 ──────────────────────────────────────────
 def planner_node(state: PlanExecuteState) -> dict:
-    prompt = PLANNER_PROMPT.format(task=state["task"])
+    # ★ 只看历史（去掉本轮那条 HumanMessage）
+    conv = _format_conversation(state["messages"][:-1]) \
+        if len(state["messages"]) > 1 else "（无）"
+
+    prompt = PLANNER_PROMPT.format(task=state["task"], conversation=conv)
     response = llm.invoke([HumanMessage(content=prompt)])
     data = _parse_json(response.content)
 
@@ -328,10 +364,8 @@ def executor_node(state: PlanExecuteState, config) -> dict:
     data = _parse_json(final_content)
     exec_result = data.get("result", final_content) if data else final_content
 
-    # 提取工具调用记录
     tool_log = _extract_tool_log(messages)
 
-    # 打印工具调用
     for t in tool_log:
         print(f"      🔧 {t['tool']}({t['args']})")
 
@@ -347,7 +381,6 @@ def reflector_node(state: PlanExecuteState) -> dict:
     else:
         context = "（无）"
 
-    # 格式化工具调用证据
     if state.get("last_tool_log"):
         lines = []
         for i, t in enumerate(state["last_tool_log"], 1):
@@ -401,10 +434,25 @@ def advance_node(state: PlanExecuteState) -> dict:
 
 def finalizer_node(state: PlanExecuteState) -> dict:
     print(f"\n📝 正在汇总最终答案...")
+
+    # ★ 只看历史
+    conv = _format_conversation(state["messages"][:-1]) \
+        if len(state["messages"]) > 1 else "（无）"
+
     results = "\n".join(f"- {s}：{r}" for s, r in state["past_steps"])
-    prompt = SUMMARIZER_PROMPT.format(task=state["task"], results=results)
+    prompt = SUMMARIZER_PROMPT.format(
+        conversation=conv,
+        task=state["task"],
+        results=results,
+    )
     response = llm.invoke([HumanMessage(content=prompt)])
-    return {"final_response": response.content}
+    final_text = response.content
+
+    # ★ 把 AI 回复写回 messages
+    return {
+        "final_response": final_text,
+        "messages": [AIMessage(content=final_text)],
+    }
 
 
 # ── 9. 路由 ──────────────────────────────────────────
@@ -456,27 +504,24 @@ def build_graph(checkpointer=None):
 
     builder.add_edge("finalizer", END)
 
-    if checkpointer:
-        agent = builder.compile(checkpointer=checkpointer)
-    else:
-        agent = builder.compile()
+    agent = builder.compile(checkpointer=checkpointer) if checkpointer \
+        else builder.compile()
 
-    # 打印 Mermaid 图（两个分支都会走到这里）
     print("\n===== Mermaid 图 =====")
     print(agent.get_graph().draw_mermaid())
     print("======================\n")
-    
+
     return agent
 
 
 # ── 11. 主循环 ───────────────────────────────────────
 if __name__ == "__main__":
     print("=" * 60)
-    print("Plan-and-Execute Agent（规划 + 执行 + 反思 + 记忆）")
+    print("Plan-and-Execute Agent（规划 + 执行 + 反思 + 短期/长期记忆）")
     print("指令：")
     print("  quit / exit / q   → 退出")
-    print("  switch <名称>     → 切换用户（隔离长期记忆）")
-    print("  clear             → 清空当前会话的短期状态")
+    print("  switch <名称>     → 切换用户（隔离长期记忆 + 短期会话）")
+    print("  clear             → 清空当前会话的短期记忆")
     print("=" * 60)
 
     ensure_memory_dir()
@@ -494,7 +539,6 @@ if __name__ == "__main__":
             break
 
         if user_input.lower() == "clear":
-            # 清空该用户所有 thread 的状态
             cursor = conn.cursor()
             cursor.execute(
                 "DELETE FROM checkpoints WHERE thread_id LIKE ?",
@@ -517,14 +561,14 @@ if __name__ == "__main__":
         if not user_input:
             continue
 
-        # 每次任务用一个新 thread_id，避免状态累积
-        import time
-        thread_id = f"{user_id}_{int(time.time() * 1000)}"
+        # ★ 固定 thread_id，让 checkpointer 累积同一会话
+        thread_id = f"{user_id}_session"
 
         try:
             result = agent.invoke(
                 {
                     "task": user_input,
+                    "messages": [HumanMessage(content=user_input)],   # ★ 追加本轮
                     "plan": [],
                     "current_step": "",
                     "past_steps": [],
